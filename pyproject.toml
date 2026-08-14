@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "document-privacy-provenance-sanitizer"
+version = "0.1.0"
+description = "Privacy-first PDF and DOCX metadata inspection and sanitization with preserved originals and audit reports."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Alessandra Desiderio" }]
+keywords = ["document-privacy", "metadata", "provenance", "pdf", "docx", "audit"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Topic :: Office/Business",
+]
+dependencies = ["pypdf>=6.0,<7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.9"]
+
+[project.scripts]
+dpps = "dpps.cli:main"
+
+[project.urls]
+Repository = "https://github.com/aley-fiore3/document-privacy-provenance-sanitizer"
+Issues = "https://github.com/aley-fiore3/document-privacy-provenance-sanitizer/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dpps"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", ".uv-cache"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
