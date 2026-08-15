@@ -26,6 +26,12 @@ Provider adapters are scoped and conservative. The local detector does not uploa
 
 Documents are untrusted. The implementation avoids executing embedded content, rejects DOCX symlink entries, refuses encrypted or signed PDF rewrites, and routes unsupported or active formats to Review. Deployments should still run with least privilege and use independent malware scanning where appropriate.
 
+## Hosted service controls
+
+The optional hosted service requires bearer authentication, plan-specific upload limits, atomic monthly usage accounting, ClamAV scanning, randomized disposable job directories, and automatic cleanup after response delivery. It returns the sanitized document and audit report together in a ZIP archive. The container runs as a non-root user.
+
+Production operators must keep `DPPS_API_KEYS` and other credentials in a managed secret store, mount the usage database on persistent encrypted storage, keep ClamAV signatures current, terminate TLS at the hosting edge, restrict administrative access, monitor failed authentication and scan events, and verify deletion behavior. Public billing must remain disabled until these controls pass end-to-end tests in the production environment.
+
 ## Reporting a vulnerability
 
 Please open a private GitHub security advisory rather than a public issue. Include the affected version, a minimal reproduction, expected behavior, and actual behavior. Do not include sensitive documents.
