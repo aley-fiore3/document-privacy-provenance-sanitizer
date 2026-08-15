@@ -69,6 +69,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "httpx2" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -78,14 +79,10 @@ service = [
     { name = "uvicorn" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "httpx2" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'service'", specifier = ">=0.115,<1" },
+    { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2.10.0" },
     { name = "pypdf", specifier = ">=6.0,<7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "python-multipart", marker = "extra == 'service'", specifier = ">=0.0.20,<1" },
@@ -93,9 +90,6 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'service'", specifier = ">=0.34,<1" },
 ]
 provides-extras = ["dev", "service"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "httpx2", specifier = ">=2.10.0" }]
 
 [[package]]
 name = "exceptiongroup"
