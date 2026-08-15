@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: fiore3-document-sanitizer
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    disk:
+      name: dpps-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DPPS_UPLOADS_ENABLED
+        value: "false"
+      - key: DPPS_API_KEYS
+        sync: false
+      - key: DPPS_USAGE_DB
+        value: /data/usage.sqlite3

@@ -132,6 +132,34 @@ Sanitization removes selected metadata fields that can expose a person's name, o
 
 Use this project only on documents you own or are authorized to process. Do not use it to misrepresent authorship, evade disclosure requirements, remove rights-management information, defeat authenticity systems, or conceal unlawful activity. See [SECURITY.md](SECURITY.md) for the threat model and limitations.
 
+## Optional hosted service
+
+Version 0.4 includes a deployable, authenticated FastAPI service. The hosted service is optional and is not used by the local command-line tool. Uploads are disabled by default and require `DPPS_UPLOADS_ENABLED=true` after deployment checks are complete.
+
+Hosted policy:
+
+- Community PDF output receives a visible `Processed with Fiore3` footer.
+- Professional, Team, and Enterprise output is unbranded.
+- No invisible watermark is added.
+- API credentials are stored as SHA-256 digests, not plaintext.
+- Plan-specific file size and monthly usage limits are enforced.
+- ClamAV scanning fails closed when scanning is unavailable.
+- Each upload is processed in a disposable working directory.
+- The response is a ZIP archive containing the sanitized copy and JSON report.
+- Working files are deleted after the response completes.
+- Customer files are not used for model training.
+
+Install service dependencies and start locally:
+
+```bash
+python -m pip install '.[service]'
+uvicorn dpps.api:app --host 127.0.0.1 --port 8080
+```
+
+The included `Dockerfile` runs the service as a non-root user and installs ClamAV. `render.yaml` describes a small persistent deployment for usage accounting. Configure `DPPS_API_KEYS` with server-side SHA-256 token digests before deployment. Do not place plaintext credentials in the repository.
+
+Billing is intentionally separate from document processing. A subscription webhook or administrator must provision or revoke API credentials after verified payment events. Do not enable public uploads or paid checkout until authentication, malware scanning, file deletion, usage limits, refunds, and webhook behavior pass end-to-end tests in the selected hosting environment.
+
 ## Project status
 
 This is an early, conservative release. Safety takes priority over format coverage: ambiguous documents are routed to Review rather than rewritten.
