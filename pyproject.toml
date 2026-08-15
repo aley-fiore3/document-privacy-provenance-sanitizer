@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "document-privacy-provenance-sanitizer"
-version = "0.1.0"
-description = "Privacy-first PDF and DOCX metadata inspection and sanitization with preserved originals and audit reports."
+version = "0.3.0"
+description = "Privacy-first document inspection, provider-scoped provenance detection, sanitization, reconstruction, and audit reporting."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
