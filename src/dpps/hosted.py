@@ -6,8 +6,10 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,10 @@ class UsageLimitExceeded(RuntimeError):
 class Principal:
     account_id: str
     plan: str
+    key_id: str = "legacy"
+
+
+_AUDIT_LOCK = threading.Lock()
 
 
 def _token_digest(token: str) -> str:
@@ -57,12 +63,23 @@ def load_api_keys(raw: str | None = None) -> dict[str, Principal]:
     payload = json.loads(raw if raw is not None else os.environ.get("DPPS_API_KEYS", "{}"))
     principals: dict[str, Principal] = {}
     for digest, record in payload.items():
-        if len(digest) != 64:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
             raise ValueError("DPPS_API_KEYS must use SHA-256 token digests as keys")
         plan = str(record["plan"]).lower()
         if plan not in PLAN_LIMITS:
             raise ValueError(f"unsupported plan in DPPS_API_KEYS: {plan}")
-        principals[digest.lower()] = Principal(str(record["account_id"]), plan)
+        if record.get("active", True) is False or record.get("revoked", False) is True:
+            continue
+        expires_at = record.get("expires_at")
+        if expires_at:
+            expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if expires <= datetime.now(timezone.utc):
+                continue
+        principals[digest.lower()] = Principal(
+            str(record["account_id"]),
+            plan,
+            str(record.get("key_id", digest[:12])),
+        )
     return principals
 
 
@@ -86,6 +103,37 @@ def validate_upload(filename: str, byte_length: int, plan: str) -> str:
     if byte_length > limit:
         raise ReviewRequired(f"file exceeds the {limit // (1024 * 1024)} MB plan limit")
     return suffix
+
+
+def max_upload_bytes(plan: str) -> int:
+    return int(PLAN_LIMITS[plan]["max_bytes"])
+
+
+def scanner_health(scanner: str = "clamscan") -> dict:
+    try:
+        result = subprocess.run(
+            [scanner, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {"status": "unavailable"}
+    version = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "unknown"
+    return {"status": "ready" if result.returncode == 0 else "unavailable", "version": version}
+
+
+def audit_event(event: dict, path: Path | None = None) -> None:
+    """Append a content-free operational event for incident review."""
+    target = path or Path(os.environ.get("DPPS_AUDIT_LOG", "/tmp/dpps-audit.jsonl"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    safe = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **{key: value for key, value in event.items() if key != "filename"},
+    }
+    with _AUDIT_LOCK, target.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(safe, sort_keys=True) + "\n")
 
 
 class UsageLedger:
@@ -145,6 +193,72 @@ class UsageLedger:
                 UPDATE monthly_usage
                 SET files = CASE WHEN files > 0 THEN files - 1 ELSE 0 END
                 WHERE account_id = ? AND period = ?
+                """,
+                (principal.account_id, period),
+            )
+
+
+class PostgresUsageLedger:
+    """Transactional usage accounting for horizontally scaled deployments."""
+
+    def __init__(self, database_url: str):
+        import psycopg
+
+        self.database_url = database_url
+        with psycopg.connect(self.database_url) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dpps_monthly_usage (
+                    account_id TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    files INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (account_id, period)
+                )
+                """
+            )
+
+    def reserve(self, principal: Principal, now: datetime | None = None) -> int:
+        import psycopg
+
+        period = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+        limit = int(PLAN_LIMITS[principal.plan]["monthly_files"])
+        with psycopg.connect(self.database_url) as connection:
+            connection.execute(
+                """
+                INSERT INTO dpps_monthly_usage (account_id, period, files)
+                VALUES (%s, %s, 0) ON CONFLICT DO NOTHING
+                """,
+                (principal.account_id, period),
+            )
+            row = connection.execute(
+                """
+                SELECT files FROM dpps_monthly_usage
+                WHERE account_id = %s AND period = %s FOR UPDATE
+                """,
+                (principal.account_id, period),
+            ).fetchone()
+            current = int(row[0])
+            if current >= limit:
+                raise UsageLimitExceeded("monthly file limit reached")
+            updated = current + 1
+            connection.execute(
+                """
+                UPDATE dpps_monthly_usage SET files = %s
+                WHERE account_id = %s AND period = %s
+                """,
+                (updated, principal.account_id, period),
+            )
+        return updated
+
+    def release(self, principal: Principal, now: datetime | None = None) -> None:
+        import psycopg
+
+        period = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+        with psycopg.connect(self.database_url) as connection:
+            connection.execute(
+                """
+                UPDATE dpps_monthly_usage SET files = GREATEST(files - 1, 0)
+                WHERE account_id = %s AND period = %s
                 """,
                 (principal.account_id, period),
             )

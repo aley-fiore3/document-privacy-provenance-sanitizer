@@ -12,11 +12,13 @@ from pypdf import PdfReader, PdfWriter
 
 from dpps.api import app
 from dpps.hosted import (
+    PLAN_LIMITS,
     AuthenticationError,
     Principal,
     UsageLedger,
     UsageLimitExceeded,
     add_visible_pdf_footer,
+    audit_event,
     authenticate,
     load_api_keys,
     process_hosted,
@@ -47,7 +49,7 @@ def test_hashed_api_key_authentication() -> None:
     store = load_api_keys(
         json.dumps({digest: {"account_id": "acct-1", "plan": "professional"}})
     )
-    assert authenticate(token, store) == Principal("acct-1", "professional")
+    assert authenticate(token, store) == Principal("acct-1", "professional", digest[:12])
     try:
         authenticate("wrong", store)
     except AuthenticationError:
@@ -128,6 +130,7 @@ def test_hosted_api_returns_zip_and_deletes_job(
     )
     monkeypatch.setenv("DPPS_UPLOADS_ENABLED", "true")
     monkeypatch.setenv("DPPS_USAGE_DB", str(tmp_path / "usage.sqlite3"))
+    monkeypatch.setenv("DPPS_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
     monkeypatch.setattr(
         "dpps.hosted.malware_scan",
         lambda source: {"engine": "ClamAV-test", "status": "clean"},
@@ -153,3 +156,74 @@ def test_hosted_api_is_safely_disabled_by_default(monkeypatch) -> None:
         files={"file": ("brief.pdf", pdf_bytes(), "application/pdf")},
     )
     assert response.status_code == 503
+
+
+def test_hosted_upload_enforces_streamed_byte_ceiling(tmp_path: Path, monkeypatch) -> None:
+    token = "small-plan-secret"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    monkeypatch.setenv(
+        "DPPS_API_KEYS",
+        json.dumps({digest: {"account_id": "acct", "plan": "community"}}),
+    )
+    monkeypatch.setenv("DPPS_UPLOADS_ENABLED", "true")
+    monkeypatch.setenv("DPPS_USAGE_DB", str(tmp_path / "usage.sqlite3"))
+    monkeypatch.setenv("DPPS_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setitem(PLAN_LIMITS["community"], "max_bytes", 100)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/sanitize",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("large.pdf", b"%PDF-" + b"x" * 200, "application/pdf")},
+    )
+    assert response.status_code == 422
+    assert "file exceeds" in response.json()["reason"]
+
+
+def test_hosted_rejects_extension_content_mismatch(tmp_path: Path, monkeypatch) -> None:
+    token = "mismatch-secret"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    monkeypatch.setenv(
+        "DPPS_API_KEYS",
+        json.dumps({digest: {"account_id": "acct", "plan": "professional"}}),
+    )
+    monkeypatch.setenv("DPPS_UPLOADS_ENABLED", "true")
+    monkeypatch.setenv("DPPS_USAGE_DB", str(tmp_path / "usage.sqlite3"))
+    monkeypatch.setenv("DPPS_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setattr(
+        "dpps.hosted.malware_scan",
+        lambda source: {"engine": "ClamAV-test", "status": "clean"},
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/v1/sanitize",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("fake.pdf", b"not a pdf", "application/pdf")},
+    )
+    assert response.status_code == 422
+    assert "signature" in response.json()["reason"]
+
+
+def test_revoked_and_expired_api_keys_are_not_loaded() -> None:
+    digest1 = "a" * 64
+    digest2 = "b" * 64
+    store = load_api_keys(
+        json.dumps(
+            {
+                digest1: {"account_id": "one", "plan": "professional", "revoked": True},
+                digest2: {
+                    "account_id": "two",
+                    "plan": "professional",
+                    "expires_at": "2020-01-01T00:00:00Z",
+                },
+            }
+        )
+    )
+    assert store == {}
+
+
+def test_audit_event_excludes_filenames(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    audit_event({"event": "test", "filename": "private-client.pdf"}, path)
+    record = json.loads(path.read_text())
+    assert record["event"] == "test"
+    assert "filename" not in record

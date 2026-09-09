@@ -16,3 +16,11 @@ services:
         sync: false
       - key: DPPS_USAGE_DB
         value: /data/usage.sqlite3
+      - key: DPPS_USAGE_DATABASE_URL
+        sync: false
+      - key: DPPS_AUDIT_LOG
+        value: /data/audit.jsonl
+      - key: DPPS_MAX_CONCURRENT_JOBS
+        value: "2"
+      - key: DPPS_PROCESSING_TIMEOUT_SECONDS
+        value: "120"

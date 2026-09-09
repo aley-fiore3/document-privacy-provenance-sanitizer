@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends clamav \
+    && apt-get install -y --no-install-recommends clamav clamav-freshclam gosu \
     && freshclam \
     && rm -rf /var/lib/apt/lists/*
 
@@ -13,7 +13,10 @@ RUN useradd --create-home --uid 10001 dpps
 WORKDIR /app
 COPY . /app
 RUN python -m pip install '.[service]'
+COPY scripts/docker-entrypoint.sh /usr/local/bin/dpps-entrypoint
+RUN chmod 0755 /usr/local/bin/dpps-entrypoint \
+    && chown -R dpps:dpps /app
 
-USER dpps
 EXPOSE 8080
-CMD ["uvicorn", "dpps.api:app", "--host", "0.0.0.0", "--port", "8080", "--no-server-header"]
+ENTRYPOINT ["/usr/local/bin/dpps-entrypoint"]
+CMD ["serve"]

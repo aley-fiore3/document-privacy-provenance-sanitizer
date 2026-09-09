@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import stat
 import xml.etree.ElementTree as ET
@@ -39,6 +40,12 @@ PROVENANCE_MARKERS = {
     b"stable signature": "StableSignature marker",
     b"synthid": "SynthID marker",
 }
+MAX_DOCX_ENTRIES = 10_000
+MAX_DOCX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_DOCX_ENTRY_BYTES = 25 * 1024 * 1024
+MAX_DOCX_COMPRESSION_RATIO = 100
+MAX_PDF_OBJECTS = 100_000
+PDF_MAGIC = b"%PDF-"
 
 
 class ReviewRequired(RuntimeError):
@@ -60,6 +67,10 @@ class Inspection:
     has_additional_actions: bool = False
     has_optional_content: bool = False
     has_acroform: bool = False
+    has_comments: bool = False
+    has_tracked_changes: bool = False
+    has_hidden_text: bool = False
+    has_external_links: bool = False
     annotation_counts: dict[str, int] | None = None
     provenance_signals: tuple[str, ...] = ()
     invisible_mark_status: str = "unknown"
@@ -79,12 +90,84 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_file_signature(source: Path, expected_suffix: str | None = None) -> str:
+    """Verify content structure instead of trusting a filename extension."""
+    suffix = (expected_suffix or source.suffix).lower()
+    if suffix == ".pdf":
+        with source.open("rb") as stream:
+            if stream.read(len(PDF_MAGIC)) != PDF_MAGIC:
+                raise ReviewRequired("file extension says PDF but the PDF signature is missing")
+        return suffix
+    if suffix == ".docx":
+        _validate_docx_package(source)
+        return suffix
+    raise ReviewRequired(f"unsupported file type: {suffix or '(none)'}")
+
+
+def _validate_docx_package(source: Path) -> None:
+    if not zipfile.is_zipfile(source):
+        raise ReviewRequired("invalid DOCX ZIP package")
+    with zipfile.ZipFile(source, "r") as archive:
+        infos = archive.infolist()
+        if len(infos) > MAX_DOCX_ENTRIES:
+            raise ReviewRequired("DOCX contains too many package entries")
+        names = {info.filename for info in infos}
+        required = {"[Content_Types].xml", "word/document.xml"}
+        if not required.issubset(names):
+            raise ReviewRequired("DOCX package is missing required Word parts")
+        total = 0
+        for info in infos:
+            path = Path(info.filename)
+            if path.is_absolute() or ".." in path.parts:
+                raise ReviewRequired("DOCX contains an unsafe package path")
+            if info.flag_bits & 0x1:
+                raise ReviewRequired("encrypted DOCX package entries are unsupported")
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise ReviewRequired("DOCX contains a symbolic-link entry")
+            if info.file_size > MAX_DOCX_ENTRY_BYTES:
+                raise ReviewRequired("DOCX package entry exceeds the decompression limit")
+            total += info.file_size
+            if total > MAX_DOCX_UNCOMPRESSED_BYTES:
+                raise ReviewRequired("DOCX expands beyond the decompression limit")
+            compressed = max(info.compress_size, 1)
+            if info.file_size > 1024 * 1024 and info.file_size / compressed > MAX_DOCX_COMPRESSION_RATIO:
+                raise ReviewRequired("DOCX has a suspicious compression ratio")
+
+
 def _pdf_catalog_has(reader: PdfReader, key: str) -> bool:
     try:
         root = reader.trailer["/Root"]
         return key in root
     except Exception:
         return False
+
+
+def _pdf_tree_has(reader: PdfReader, keys: set[str], action_types: set[str] | None = None) -> bool:
+    """Inspect the PDF object graph without executing or decoding active content."""
+    stack = [reader.trailer.get("/Root")]
+    seen: set[tuple[int, int]] = set()
+    visited = 0
+    while stack:
+        value = stack.pop()
+        identifier = None
+        if hasattr(value, "idnum"):
+            identifier = (int(value.idnum), int(getattr(value, "generation", 0)))
+            if identifier in seen:
+                continue
+            seen.add(identifier)
+        resolved = _resolved(value)
+        visited += 1
+        if visited > MAX_PDF_OBJECTS:
+            raise ReviewRequired("PDF object graph exceeds the inspection limit")
+        if isinstance(resolved, dict):
+            if any(str(key) in keys for key in resolved):
+                return True
+            if action_types and str(resolved.get("/S", "")) in action_types:
+                return True
+            stack.extend(resolved.values())
+        elif isinstance(resolved, (list, tuple)):
+            stack.extend(resolved)
+    return False
 
 
 def _resolved(value):
@@ -128,6 +211,7 @@ def _pdf_is_signed(reader: PdfReader, source: Path) -> bool:
 
 
 def inspect_pdf(source: Path) -> Inspection:
+    validate_file_signature(source, ".pdf")
     reader = PdfReader(str(source), strict=False)
     encrypted = reader.is_encrypted
     if encrypted:
@@ -142,8 +226,8 @@ def inspect_pdf(source: Path) -> Inspection:
         )
     signed = _pdf_is_signed(reader, source)
     raw = source.read_bytes()
-    has_javascript = _pdf_catalog_has(reader, "/Names") and b"/JavaScript" in raw
-    has_embedded_files = _pdf_catalog_has(reader, "/Names") and b"/EmbeddedFiles" in raw
+    has_javascript = _pdf_tree_has(reader, {"/JavaScript"}, {"/JavaScript"})
+    has_embedded_files = _pdf_tree_has(reader, {"/EmbeddedFiles", "/FileSpec"})
     review_reasons = []
     if signed:
         review_reasons.append("digitally signed PDF; rewriting would invalidate the signature")
@@ -185,24 +269,42 @@ def _xml_values(data: bytes) -> dict[str, str]:
 
 
 def inspect_docx(source: Path) -> Inspection:
-    if not zipfile.is_zipfile(source):
-        raise ReviewRequired("invalid DOCX ZIP package")
+    _validate_docx_package(source)
     metadata: dict[str, str] = {}
     with zipfile.ZipFile(source, "r") as archive:
         names = set(archive.namelist())
-        if "word/document.xml" not in names:
-            raise ReviewRequired("DOCX package has no word/document.xml")
-        for name in ("docProps/core.xml", "docProps/app.xml"):
+        for name in ("docProps/core.xml", "docProps/app.xml", "docProps/custom.xml"):
             if name in names:
-                metadata.update(_xml_values(archive.read(name)))
-        for info in archive.infolist():
-            if stat.S_ISLNK(info.external_attr >> 16):
-                raise ReviewRequired("DOCX contains a symbolic-link entry")
+                values = _xml_values(archive.read(name))
+                prefix = "custom:" if name.endswith("custom.xml") else ""
+                metadata.update({f"{prefix}{key}": value for key, value in values.items()})
+        document_xml = archive.read("word/document.xml")
+        comments = any(name.startswith("word/comments") for name in names)
+        tracked = bool(re.search(rb"<w:(?:ins|del|moveFrom|moveTo)\b", document_xml))
+        hidden = bool(re.search(rb"<w:(?:vanish|webHidden)\b", document_xml))
+        external_links = False
+        for name in names:
+            if name.endswith(".rels") and b'TargetMode="External"' in archive.read(name):
+                external_links = True
+                break
+    review_reasons = []
+    if comments:
+        review_reasons.append("DOCX contains comments")
+    if tracked:
+        review_reasons.append("DOCX contains tracked changes")
+    if hidden:
+        review_reasons.append("DOCX contains hidden text")
     return Inspection(
         path=str(source),
         format="docx",
         sha256=sha256_file(source),
         metadata=metadata,
+        has_comments=comments,
+        has_tracked_changes=tracked,
+        has_hidden_text=hidden,
+        has_external_links=external_links,
+        requires_review=bool(review_reasons),
+        review_reason="; ".join(review_reasons) or None,
     )
 
 
@@ -351,21 +453,26 @@ def reconstruct_pdf(source: Path, output: Path) -> dict:
 
 def sanitize_docx(source: Path, output: Path) -> dict:
     before = inspect_docx(source)
-    clear = {
-        "docProps/core.xml": {"creator", "lastModifiedBy", "revision"},
-        "docProps/app.xml": {"Application", "AppVersion", "Company", "Manager", "Template"},
-    }
+    if before.requires_review:
+        raise ReviewRequired(before.review_reason or "DOCX requires review")
+    metadata_parts = {"docProps/core.xml", "docProps/app.xml"}
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w") as zout:
         for info in zin.infolist():
-            if stat.S_ISLNK(info.external_attr >> 16):
-                output.unlink(missing_ok=True)
-                raise ReviewRequired("DOCX contains a symbolic-link entry")
+            if info.filename == "docProps/custom.xml":
+                continue
             data = zin.read(info.filename)
-            if info.filename in clear:
+            if info.filename in {"[Content_Types].xml", "_rels/.rels"}:
+                root = ET.fromstring(data)
+                for node in list(root):
+                    attributes = " ".join(str(value) for value in node.attrib.values())
+                    if "custom-properties" in attributes or "docProps/custom.xml" in attributes:
+                        root.remove(node)
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            if info.filename in metadata_parts:
                 root = ET.fromstring(data)
                 for node in root.iter():
-                    if node.tag.rsplit("}", 1)[-1] in clear[info.filename]:
+                    if len(node) == 0 and node.text:
                         node.text = ""
                 data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
             zout.writestr(info, data)
@@ -406,7 +513,7 @@ def init_workspace(root: Path) -> None:
         (root / name).mkdir(parents=True, exist_ok=True)
 
 
-def process_once(root: Path, mode: str = "metadata") -> list[dict]:
+def process_once(root: Path, mode: str = "metadata", privacy_names: bool = False) -> list[dict]:
     root = Path(root).expanduser().resolve()
     init_workspace(root)
     results = []
@@ -429,7 +536,12 @@ def process_once(root: Path, mode: str = "metadata") -> list[dict]:
         try:
             if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 raise ReviewRequired("unsupported or potentially active document type")
-            clean = _unique(root / "Clean", source.name)
+            clean_name = (
+                f"document-{report['original_sha256'][:12]}{source.suffix.lower()}"
+                if privacy_names
+                else source.name
+            )
+            clean = _unique(root / "Clean", clean_name)
             details = sanitize(original, clean, mode=mode)
             report.update(status="cleaned", clean=str(clean), details=details)
         except Exception as exc:

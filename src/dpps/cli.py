@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .core import ReviewRequired, init_workspace, inspect, process_once, sanitize
+from .core import ReviewRequired, init_workspace, inspect, process_once, sanitize, sha256_file
 from .detectors import KNOWN_PROVIDERS, detect, export_review_assets
 
 
@@ -40,6 +40,12 @@ def main() -> int:
     clean_cmd = sub.add_parser("sanitize", help="write a metadata-sanitized copy")
     clean_cmd.add_argument("source", type=Path)
     clean_cmd.add_argument("--output", "-o", type=Path, required=True)
+    clean_cmd.add_argument("--report", type=Path, help="save the JSON audit report")
+    clean_cmd.add_argument(
+        "--privacy-name",
+        action="store_true",
+        help="replace the output filename with a neutral hash-based name",
+    )
     clean_cmd.add_argument(
         "--mode",
         choices=("metadata", "reconstruct"),
@@ -53,6 +59,13 @@ def main() -> int:
     process_cmd.add_argument(
         "--mode", choices=("metadata", "reconstruct"), default="metadata"
     )
+    process_cmd.add_argument(
+        "--privacy-names",
+        action="store_true",
+        help="use neutral hash-based filenames in Clean",
+    )
+    status_cmd = sub.add_parser("status", help="show watch-folder counts")
+    status_cmd.add_argument("root", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "scan":
@@ -62,12 +75,33 @@ def main() -> int:
         elif args.command == "export-review-assets":
             _json(export_review_assets(args.source, args.output))
         elif args.command == "sanitize":
-            _json(sanitize(args.source, args.output, mode=args.mode))
+            output = args.output
+            if args.privacy_name:
+                output = output.parent / f"document-{sha256_file(args.source)[:12]}{args.source.suffix.lower()}"
+            result = sanitize(args.source, output, mode=args.mode)
+            result["output"] = str(output.expanduser().resolve())
+            if args.report:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                args.report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+                result["report"] = str(args.report.expanduser().resolve())
+            _json(result)
         elif args.command == "init":
             init_workspace(args.root.expanduser().resolve())
             _json({"status": "initialized", "root": str(args.root.expanduser().resolve())})
         elif args.command == "process-once":
-            _json(process_once(args.root, mode=args.mode))
+            _json(process_once(args.root, mode=args.mode, privacy_names=args.privacy_names))
+        elif args.command == "status":
+            root = args.root.expanduser().resolve()
+            init_workspace(root)
+            _json(
+                {
+                    "root": str(root),
+                    "counts": {
+                        name.lower(): sum(1 for path in (root / name).iterdir() if path.is_file())
+                        for name in ("Incoming", "Clean", "Originals", "Review", "Reports")
+                    },
+                }
+            )
         return 0
     except (ReviewRequired, ValueError, OSError) as exc:
         _json({"status": "review", "reason": str(exc)})

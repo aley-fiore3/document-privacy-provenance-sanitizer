@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "document-privacy-provenance-sanitizer"
-version = "0.4.0"
+version = "0.5.0"
 description = "Privacy-first document inspection, provider-scoped provenance detection, sanitization, reconstruction, and audit reporting."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,12 +19,13 @@ classifiers = [
   "Topic :: Security",
   "Topic :: Office/Business",
 ]
-dependencies = ["pypdf>=6.0,<7"]
+dependencies = ["pypdf>=6.16.1,<7"]
 
 [project.optional-dependencies]
-dev = ["httpx2>=2.10.0", "pytest>=8", "ruff>=0.9"]
+dev = ["httpx2>=2.12.0", "pytest>=8", "ruff>=0.9"]
 service = [
   "fastapi>=0.115,<1",
+  "psycopg[binary]>=3.2,<4",
   "python-multipart>=0.0.20,<1",
   "uvicorn>=0.34,<1",
 ]

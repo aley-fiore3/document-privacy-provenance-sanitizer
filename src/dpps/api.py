@@ -2,35 +2,45 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 import zipfile
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from .core import ReviewRequired
 from .hosted import (
     AuthenticationError,
+    PostgresUsageLedger,
     UsageLedger,
     UsageLimitExceeded,
+    audit_event,
     authenticate,
     load_api_keys,
+    max_upload_bytes,
     process_hosted,
+    scanner_health,
     validate_upload,
 )
 
 app = FastAPI(
     title="Fiore3 Document Privacy Sanitizer",
-    version="0.4.0",
+    version="0.5.0",
     docs_url=None,
     redoc_url=None,
 )
+_PROCESSING_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.environ.get("DPPS_MAX_CONCURRENT_JOBS", "2")))
+)
 
 
-def _usage_ledger() -> UsageLedger:
+def _usage_ledger() -> UsageLedger | PostgresUsageLedger:
+    if database_url := os.environ.get("DPPS_USAGE_DATABASE_URL"):
+        return PostgresUsageLedger(database_url)
     return UsageLedger(Path(os.environ.get("DPPS_USAGE_DB", "/data/usage.sqlite3")))
 
 
@@ -51,11 +61,16 @@ def _bearer(authorization: str | None) -> str:
 
 
 @app.get("/health")
-def health() -> dict:
+def health(response: Response) -> dict:
+    scanner = scanner_health()
+    degraded = _uploads_enabled() and scanner["status"] != "ready"
+    if degraded:
+        response.status_code = 503
     return {
-        "status": "ok",
+        "status": "degraded" if degraded else "ok",
         "uploads_enabled": _uploads_enabled(),
         "billing_ready": False,
+        "scanner": scanner,
     }
 
 
@@ -71,27 +86,62 @@ async def sanitize_document(
             status_code=503,
             detail="document processing is not enabled on this deployment",
         )
+    if mode not in {"metadata", "reconstruct"}:
+        raise HTTPException(status_code=422, detail="unsupported sanitization mode")
     work = Path(tempfile.mkdtemp(prefix="dpps-job-"))
     principal = None
     reserved = False
+    acquired = False
     ledger = _usage_ledger()
     try:
         principal = authenticate(_bearer(authorization), load_api_keys())
         filename = Path(file.filename or "upload.bin").name
         source = work / filename
-        data = await file.read()
-        validate_upload(filename, len(data), principal.plan)
+        limit = max_upload_bytes(principal.plan)
+        byte_length = 0
+        with source.open("wb") as stream:
+            while chunk := await file.read(1024 * 1024):
+                byte_length += len(chunk)
+                if byte_length > limit:
+                    raise ReviewRequired(
+                        f"file exceeds the {limit // (1024 * 1024)} MB plan limit"
+                    )
+                stream.write(chunk)
+        validate_upload(filename, byte_length, principal.plan)
         ledger.reserve(principal)
         reserved = True
-        source.write_bytes(data)
+        try:
+            await asyncio.wait_for(_PROCESSING_SEMAPHORE.acquire(), timeout=1)
+            acquired = True
+        except TimeoutError as exc:
+            raise ReviewRequired("service is at processing capacity; retry shortly") from exc
         output = work / f"{source.stem}-sanitized{source.suffix.lower()}"
-        report = process_hosted(source, output, principal, mode=mode)
+        timeout = max(5, int(os.environ.get("DPPS_PROCESSING_TIMEOUT_SECONDS", "120")))
+        try:
+            report = await asyncio.wait_for(
+                asyncio.to_thread(process_hosted, source, output, principal, mode),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            raise ReviewRequired("document processing timed out") from exc
         report_path = work / "report.json"
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         bundle = work / f"{source.stem}-fiore3-results.zip"
         with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(output, output.name)
             archive.write(report_path, report_path.name)
+        audit_event(
+            {
+                "event": "sanitize_completed",
+                "account_id": principal.account_id,
+                "key_id": principal.key_id,
+                "plan": principal.plan,
+                "format": source.suffix.lower().lstrip("."),
+                "byte_length": byte_length,
+                "source_sha256": report["source_sha256"],
+                "output_sha256": report["output_sha256"],
+            }
+        )
         background_tasks.add_task(_delete_tree, work)
         return FileResponse(
             bundle,
@@ -107,6 +157,15 @@ async def sanitize_document(
         if reserved and principal is not None:
             ledger.release(principal)
         _delete_tree(work)
+        if principal is not None:
+            audit_event(
+                {
+                    "event": "sanitize_review",
+                    "account_id": principal.account_id,
+                    "key_id": principal.key_id,
+                    "reason": str(exc),
+                }
+            )
         return JSONResponse(status_code=422, content={"status": "review", "reason": str(exc)})
     except UsageLimitExceeded as exc:
         _delete_tree(work)
@@ -116,3 +175,6 @@ async def sanitize_document(
             ledger.release(principal)
         _delete_tree(work)
         raise
+    finally:
+        if acquired:
+            _PROCESSING_SEMAPHORE.release()
