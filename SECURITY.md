@@ -24,7 +24,7 @@ Provider adapters are scoped and conservative. The local detector does not uploa
 
 ## Untrusted inputs
 
-Documents are untrusted. The implementation avoids executing embedded content, rejects DOCX symlink entries, refuses encrypted or signed PDF rewrites, and routes unsupported or active formats to Review. Deployments should still run with least privilege and use independent malware scanning where appropriate.
+Documents are untrusted. The implementation avoids executing embedded content, verifies PDF and DOCX structure rather than trusting extensions, rejects DOCX traversal paths, symlinks, encryption, excessive entry counts, oversized expansion, and suspicious compression ratios, refuses encrypted or signed PDF rewrites, and routes unsupported or active formats to Review. Deployments should still run with least privilege and use independent malware scanning where appropriate.
 
 ## Hosted service controls
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, DictionaryObject, NameObject, TextStringObject
 
-from dpps.core import inspect, process_once, sanitize
+from dpps.core import ReviewRequired, inspect, process_once, sanitize
 from dpps.detectors import detect, export_review_assets
 
 
@@ -132,3 +132,25 @@ def test_review_asset_export_writes_manifest_without_assets(tmp_path: Path) -> N
     report = export_review_assets(source, output)
     assert report["assets"] == []
     assert (output / "manifest.json").exists()
+
+
+def test_pdf_extension_without_pdf_signature_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "fake.pdf"
+    source.write_bytes(b"not a pdf")
+    try:
+        inspect(source)
+    except ReviewRequired as exc:
+        assert "signature" in str(exc)
+    else:
+        raise AssertionError("fake PDF was accepted")
+
+
+def test_workflow_can_use_privacy_safe_output_names(tmp_path: Path) -> None:
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    source = incoming / "Private Client Name.pdf"
+    make_pdf(source)
+    result = process_once(tmp_path, privacy_names=True)[0]
+    clean = Path(result["clean"])
+    assert clean.name.startswith("document-")
+    assert "Private Client" not in clean.name

@@ -22,7 +22,7 @@ This project is designed for responsible document preparation before external di
 | Format | Inspection | Sanitization | Automatic safeguards |
 |---|---:|---:|---|
 | PDF | Yes | Document-info and XMP metadata | Encrypted and signed PDFs go to Review |
-| DOCX | Yes | Creator, last editor, revision, application, company, manager, and template properties | Invalid or symlink-containing packages go to Review |
+| DOCX | Yes | Core, application, and custom document properties | Invalid or suspicious packages, comments, tracked changes, and hidden text go to Review |
 | DOCM/DOTM/PPTM/XLSM | Limited | No | Always Review |
 | Other files | No | No | Preserved and routed to Review |
 
@@ -88,6 +88,12 @@ Create a separate sanitized copy:
 dpps sanitize document.pdf --output document-clean.pdf
 ```
 
+Save the audit report and use a neutral output filename:
+
+```bash
+dpps sanitize "Client Name.pdf" --output Clean/result.pdf --privacy-name --report Reports/result.json
+```
+
 Build a fresh PDF catalog from visible pages:
 
 ```bash
@@ -114,6 +120,12 @@ Use reconstruction for a folder batch:
 dpps process-once ~/Document-Privacy-Workflow --mode reconstruct
 ```
 
+Use neutral filenames for clean output:
+
+```bash
+dpps process-once ~/Document-Privacy-Workflow --privacy-names
+```
+
 The workflow creates:
 
 ```text
@@ -126,7 +138,7 @@ Reports   -> JSON audit records
 
 ## What sanitization means here
 
-Sanitization removes selected metadata fields that can expose a person's name, organization, editing application, or document history. Reconstruction also creates a minimal new PDF catalog and excludes supported active or hidden review objects. Neither mode claims that a document is anonymous, non-AI-generated, or free of every possible provenance signal. Page content, filenames, embedded text, links, and visual design may still reveal origin or identity. The sanitizer does not add a replacement watermark.
+Sanitization removes document-property fields that can expose a person's name, organization, editing application, custom labels, or document history. DOCX comments, tracked changes, and hidden text are reported and routed to Review because deleting them can alter meaning. External links are reported but preserved. Reconstruction also creates a minimal new PDF catalog and excludes supported active or hidden review objects. Neither mode claims that a document is anonymous, non-AI-generated, or free of every possible provenance signal. Page content, filenames, embedded text, links, and visual design may still reveal origin or identity. The sanitizer does not add a replacement watermark.
 
 ## Ethical use
 
@@ -134,7 +146,7 @@ Use this project only on documents you own or are authorized to process. Do not 
 
 ## Optional hosted service
 
-Version 0.4 includes a deployable, authenticated FastAPI service. The hosted service is optional and is not used by the local command-line tool. Uploads are disabled by default and require `DPPS_UPLOADS_ENABLED=true` after deployment checks are complete.
+Version 0.5 includes a deployable, authenticated FastAPI service. The hosted service is optional and is not used by the local command-line tool. Uploads are disabled by default and require `DPPS_UPLOADS_ENABLED=true` after deployment checks are complete.
 
 Hosted policy:
 
@@ -143,7 +155,12 @@ Hosted policy:
 - No invisible watermark is added.
 - API credentials are stored as SHA-256 digests, not plaintext.
 - Plan-specific file size and monthly usage limits are enforced.
+- Uploads are streamed with a hard plan-specific byte ceiling.
+- Processing has configurable concurrency and time limits.
+- Revoked, disabled, and expired API keys are rejected.
 - ClamAV scanning fails closed when scanning is unavailable.
+- ClamAV signature refresh runs in the service container.
+- Content-free operational audit events omit filenames and document contents.
 - Each upload is processed in a disposable working directory.
 - The response is a ZIP archive containing the sanitized copy and JSON report.
 - Working files are deleted after the response completes.
@@ -156,7 +173,53 @@ python -m pip install '.[service]'
 uvicorn dpps.api:app --host 127.0.0.1 --port 8080
 ```
 
-The included `Dockerfile` runs the service as a non-root user and installs ClamAV. `render.yaml` describes a small persistent deployment for usage accounting. Configure `DPPS_API_KEYS` with server-side SHA-256 token digests before deployment. Do not place plaintext credentials in the repository.
+The included `Dockerfile` runs the service as a non-root user and installs ClamAV. `render.yaml` describes a small persistent deployment. Configure `DPPS_API_KEYS` with server-side SHA-256 token digests before deployment. For more than one service instance, configure `DPPS_USAGE_DATABASE_URL` with a managed Postgres connection; local SQLite remains the single-instance fallback. Do not place plaintext credentials in the repository.
+
+Each API-key record can include a non-secret `key_id`, `active`, `revoked`, and ISO 8601 `expires_at` value. Rotation means adding the replacement digest, deploying it, moving clients to the new token, then marking the old record revoked. Never log or commit the plaintext token.
+
+```json
+{
+  "<64-character-sha256-digest>": {
+    "account_id": "customer-id",
+    "plan": "professional",
+    "key_id": "customer-2026-09",
+    "active": true,
+    "expires_at": "2027-01-01T00:00:00Z"
+  }
+}
+```
+
+## macOS watch folder
+
+Install the automatic local workflow after installing the project:
+
+```bash
+scripts/macos/install-watch-folder.sh
+```
+
+Drop PDF or DOCX files into `~/Documents/Fiore3-Document-Privacy/Incoming`. macOS runs the conservative metadata sanitizer, preserves originals and reports, uses privacy-safe clean filenames, and posts a notification. Check counts with:
+
+```bash
+dpps status ~/Documents/Fiore3-Document-Privacy
+```
+
+Remove only the watch service, leaving all documents intact:
+
+```bash
+scripts/macos/uninstall-watch-folder.sh
+```
+
+The installer creates a per-user LaunchAgent. It does not run until you execute the installer locally. Logs stay inside the workflow's `Logs` folder. Files needing judgment remain unchanged in `Review`.
+
+## Compatibility regression corpus
+
+The committed tests generate safe synthetic fixtures. Private real-world samples can be tested without committing filenames or documents:
+
+```bash
+python scripts/validate-corpus.py tests/private-corpus --output corpus-results/report.json
+```
+
+Both paths are ignored by Git. The results use short content hashes as source identifiers and delete temporary sanitized copies after validation.
 
 Billing is intentionally separate from document processing. A subscription webhook or administrator must provision or revoke API credentials after verified payment events. Do not enable public uploads or paid checkout until authentication, malware scanning, file deletion, usage limits, refunds, and webhook behavior pass end-to-end tests in the selected hosting environment.
 
